@@ -130,9 +130,10 @@ Publishing writes, in order:
    Azure pipeline with the same name aborts beforehand).
 2. A **draft** pull request — you review and merge it; nothing touches the
    default branch directly.
-3. One Azure pipeline definition per file, created against the repo's
-   **default branch** (`refs/heads/<default>`) via `--yml-path` with
-   `--skip-first-run true`, so the command itself never queues a run.
+3. One Azure pipeline definition per file, created against the new
+   `gh-to-azdo/<id>` branch via `--yml-path` with `--skip-first-run true`.
+   This branch already contains the generated YAML, so the pipeline can be
+   run as soon as it is imported; the command itself never queues a run.
 
 `--plan` performs all reads and previews the selections and the
 file→pipeline mapping without any writes (sign-in still happens) — it is
@@ -155,6 +156,10 @@ Honest limitations:
 - Code stays on GitHub — nothing is copied. Pipelines are GitHub-backed and
   need the service connection plus YAML PR/build-validation setup reviewed
   manually.
+- The imported pipeline initially uses the `gh-to-azdo/<id>` branch as its
+  default branch so Azure can find the YAML before the draft PR is merged.
+  After merging the PR, change the pipeline's default branch to the repository
+  default branch if you want manual and scheduled runs to use it.
 - The command never queues a first run, but automatic triggers **may** apply
   as soon as the YAML is present on a watched branch — the new branch and the
   draft PR itself can trigger existing GitHub automation. Test the generated

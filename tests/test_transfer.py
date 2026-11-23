@@ -286,14 +286,15 @@ class TestTransferFlow(unittest.TestCase):
         self.assertIs(pr_body["draft"], True)
         self.assertIn("pull/42", err)
 
-        # Azure pipeline created against the default branch, not the temp branch.
+        # Azure uses the branch that already contains the generated YAML.
         self.assertEqual(len(az.create_calls), 1)
         call = az.create_calls[0]
         self.assertEqual(call["org"], "testorg")
         self.assertEqual(call["project"], PROJECT_ID)
         self.assertEqual(call["connection"], CONN_ID)
         self.assertEqual(call["repo"], "owner/repo")
-        self.assertEqual(call["branch"], "refs/heads/main")
+        self.assertEqual(call["branch"], ref_body["ref"])
+        self.assertNotEqual(call["branch"], "refs/heads/main")
         self.assertEqual(call["pipeline"].name, "GHA-owner-repo-ci")
         self.assertTrue(call["pipeline"].path.startswith("github-to-azdo-"))
         self.assertTrue(call["pipeline"].path.endswith("/ci.yml"))

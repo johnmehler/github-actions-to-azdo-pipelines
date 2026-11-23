@@ -4,10 +4,10 @@
 the locally installed ``gh`` and ``az`` CLIs: GitHub stays the source of truth
 (code is never copied), converted Azure Pipelines YAML is committed on a new
 ``gh-to-azdo/<id>`` branch behind a **draft** pull request, and Azure pipeline
-definitions are created against the repository's default branch with first-run
-queueing disabled.  Existing GitHub Actions workflows are never disabled or
-deleted, the default branch is never written directly, and no pipeline run is
-triggered by the command itself.
+definitions use that branch so the YAML is available as soon as each pipeline
+is imported.  First-run queueing is disabled.  Existing GitHub Actions
+workflows are never disabled or deleted, the default branch is never written
+directly, and no pipeline run is triggered by the command itself.
 """
 
 from __future__ import annotations
@@ -1028,7 +1028,7 @@ def _publish_all(
                 project_id,
                 connection_id,
                 repo,
-                f"refs/heads/{default_branch}",
+                f"refs/heads/{branch}",
                 pipeline_file,
             )
             pipeline_id = result["id"]
@@ -1165,8 +1165,8 @@ def _transfer(
     print(f"  branch:      {branch}")
     print(f"  PR:          draft pull request on {repo}")
     print(
-        f"  pipelines:   one per file on refs/heads/{default_branch} "
-        "(first run is not queued)"
+        f"  pipelines:   one per file on refs/heads/{branch} "
+        "(YAML is available immediately; first run is not queued)"
     )
     print(
         "  unchanged:   existing GitHub Actions workflows are not disabled; "
@@ -1223,9 +1223,10 @@ def _transfer(
         connection_id=connection_id,
     )
     print(
-        "\nDone. Merge the draft PR to place the YAML on the default branch; "
-        "Azure pipelines point at that branch and will use their configured "
-        "triggers afterwards. No runs were queued by this command."
+        "\nDone. Azure pipelines point at the migration branch containing the "
+        "YAML. Merge the draft PR to add it to the default branch; then change "
+        f"the pipeline default branch to refs/heads/{default_branch} if needed. "
+        "No runs were queued by this command."
     )
     return 0
 

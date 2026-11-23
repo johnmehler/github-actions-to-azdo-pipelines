@@ -1,0 +1,6 @@
+{
+    "azure-pipelines.organization": "johnmehler",
+    "azure-pipelines.project": "cloudjobs",
+    "azure-pipelines.serverUrl": "",
+    "azure-pipelines.authMethod": "pat"
+}
