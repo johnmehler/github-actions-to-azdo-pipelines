@@ -13,6 +13,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 from github_to_azdo import licensing, transfer
 from github_to_azdo.transfer import PipelineFile, TransferError
 
@@ -62,6 +64,7 @@ class FakeGitHub:
         self.login = login
         self.get_calls: list[tuple[str, bool]] = []
         self.post_calls: list[tuple[str, dict]] = []
+        self.patch_calls: list[tuple[str, dict]] = []
 
     def authenticate(self) -> str:
         return self.login
@@ -84,6 +87,10 @@ class FakeGitHub:
             return value(endpoint, body)
         return value
 
+    def patch(self, endpoint: str, body: dict):
+        self.patch_calls.append((endpoint, body))
+        return {}
+
 
 _MISSING = object()
 
@@ -98,6 +105,7 @@ class FakeAzure:
         connections=None,
         conflicts=None,
         create_error_on: int | None = None,
+        pipeline_overrides=None,
     ):
         self._projects = (
             projects
@@ -111,9 +119,12 @@ class FakeAzure:
         )
         self._conflicts = conflicts or {}
         self._create_error_on = create_error_on
+        self._pipeline_overrides = pipeline_overrides or {}
+        self._definitions: dict[int, dict] = {}
         self._create_count = 0
         self.authenticated = False
         self.create_calls: list[dict] = []
+        self.pipeline_calls: list[tuple[str, str, int]] = []
 
     def authenticate(self) -> None:
         self.authenticated = True
@@ -141,7 +152,24 @@ class FakeAzure:
         )
         if self._create_error_on == self._create_count:
             raise TransferError("simulated Azure failure")
-        return {"id": 100 + self._create_count}
+        pipeline_id = 100 + self._create_count
+        self._definitions[pipeline_id] = {
+            "id": pipeline_id,
+            "repository": {"defaultBranch": branch},
+            "process": {"yamlFilename": pipeline.path},
+        }
+        return {"id": pipeline_id}
+
+    def pipeline(self, org, project, pipeline_id):
+        self.pipeline_calls.append((org, project, pipeline_id))
+        source = self._definitions[pipeline_id]
+        detail = {
+            "id": source["id"],
+            "repository": dict(source["repository"]),
+            "process": dict(source["process"]),
+        }
+        detail.update(self._pipeline_overrides.get(pipeline_id, {}))
+        return detail
 
 
 def default_responses(workflow_text: str = WORKFLOW, workflows=None):
@@ -255,7 +283,8 @@ class TestTransferFlow(unittest.TestCase):
         self.assertIn(f"repos/owner/repo/git/commits/{HEAD}", get_endpoints)
         self.assertIn(f"repos/owner/repo/git/trees/{TREE}", get_endpoints)
 
-        # Write order: tree -> commit -> ref -> pull request.
+        # Write order: tree -> commit -> ref -> pull request; the post-merge
+        # workflow is added after Azure returns the pipeline id.
         post_endpoints = [endpoint for endpoint, _ in gh.post_calls]
         self.assertEqual(
             post_endpoints,
@@ -264,6 +293,8 @@ class TestTransferFlow(unittest.TestCase):
                 "repos/owner/repo/git/commits",
                 "repos/owner/repo/git/refs",
                 "repos/owner/repo/pulls",
+                "repos/owner/repo/git/trees",
+                "repos/owner/repo/git/commits",
             ],
         )
         tree_body = gh.post_calls[0][1]
@@ -284,9 +315,10 @@ class TestTransferFlow(unittest.TestCase):
         self.assertEqual(pr_body["base"], "main")
         self.assertTrue(pr_body["head"].startswith("gh-to-azdo/"))
         self.assertIs(pr_body["draft"], True)
+        self.assertIn("AZURE_DEVOPS_EXT_PAT", pr_body["body"])
         self.assertIn("pull/42", err)
 
-        # Azure uses the branch that already contains the generated YAML.
+        # Azure uses, and was read back with, the branch containing the YAML.
         self.assertEqual(len(az.create_calls), 1)
         call = az.create_calls[0]
         self.assertEqual(call["org"], "testorg")
@@ -299,6 +331,118 @@ class TestTransferFlow(unittest.TestCase):
         self.assertTrue(call["pipeline"].path.startswith("github-to-azdo-"))
         self.assertTrue(call["pipeline"].path.endswith("/ci.yml"))
         self.assertIn("trigger:", call["pipeline"].yaml)
+        self.assertEqual(az.pipeline_calls, [("testorg", PROJECT_ID, 101)])
+
+        # The finalizer updates that same pipeline after the PR reaches main.
+        finalizer_tree = gh.post_calls[4][1]
+        self.assertEqual(finalizer_tree["base_tree"], NEW_TREE)
+        finalizer_entry = finalizer_tree["tree"][0]
+        self.assertTrue(
+            finalizer_entry["path"].startswith(
+                ".github/workflows/gh-to-azdo-finalize-"
+            )
+        )
+        self.assertTrue(finalizer_entry["path"].endswith(".yml"))
+        finalizer = finalizer_entry["content"]
+        self.assertIn("types: [closed]", finalizer)
+        self.assertIn("TARGET_REF: refs/heads/main", finalizer)
+        self.assertIn("GH_REPO: owner/repo", finalizer)
+        self.assertIn("AZURE_ORG_URL: https://dev.azure.com/testorg", finalizer)
+        self.assertIn(f"AZURE_PROJECT: {PROJECT_ID}", finalizer)
+        self.assertIn('"id":101', finalizer)
+        self.assertIn(call["pipeline"].path, finalizer)
+        self.assertIn(call["branch"].removeprefix("refs/heads/"), finalizer)
+        finalizer_commit = gh.post_calls[5][1]
+        self.assertEqual(finalizer_commit["parents"], [NEW_COMMIT])
+        self.assertEqual(finalizer_commit["tree"], NEW_TREE)
+        self.assertEqual(len(gh.patch_calls), 1)
+        self.assertEqual(
+            gh.patch_calls[0],
+            (
+                f"repos/owner/repo/git/{ref_body['ref']}",
+                {"sha": NEW_COMMIT, "force": False},
+            ),
+        )
+        self.assertIn("added post-merge branch update workflow", err)
+
+    def test_post_merge_switch_can_be_disabled(self):
+        gh = FakeGitHub(default_responses())
+        az = FakeAzure()
+        status, error, _out, _err = run_transfer_captured(
+            ["1", "1", "1", "1", "PUBLISH"],
+            gh,
+            az,
+            org="testorg",
+            post_merge_switch=False,
+        )
+        self.assertIsNone(error)
+        self.assertEqual(status, 0)
+        self.assertEqual(len(gh.post_calls), 4)
+        self.assertEqual(gh.patch_calls, [])
+        self.assertEqual(az.pipeline_calls, [("testorg", PROJECT_ID, 101)])
+        self.assertNotIn("AZURE_DEVOPS_EXT_PAT", gh.post_calls[3][1]["body"])
+
+    def test_post_merge_workflow_is_valid_and_scoped(self):
+        pipeline = PipelineFile(
+            source=".github/workflows/ci.yml",
+            path="github-to-azdo-abc/ci.yml",
+            name="GHA-owner-repo-ci",
+            yaml="trigger: {}\n",
+        )
+        path, text = transfer._post_merge_workflow(
+            repo="owner/repo",
+            branch="gh-to-azdo/abc",
+            default_branch="main",
+            org="testorg",
+            project_id=PROJECT_ID,
+            transfer_id="abc",
+            pipelines=[(42, pipeline)],
+        )
+        self.assertEqual(path, ".github/workflows/gh-to-azdo-finalize-abc.yml")
+        parsed = yaml.safe_load(text)
+        triggers = parsed.get("on", parsed.get(True))
+        self.assertIn("push", triggers)
+        self.assertIn("pull_request", triggers)
+        job = parsed["jobs"]["update-pipeline-default-branch"]
+        self.assertIn("github.event.pull_request.merged == true", job["if"])
+        self.assertIn("github.event.pull_request.head.ref == 'gh-to-azdo/abc'", job["if"])
+        env = job["env"]
+        self.assertEqual(env["TARGET_REF"], "refs/heads/main")
+        self.assertEqual(env["GH_REPO"], "owner/repo")
+        self.assertEqual(env["AZURE_PROJECT"], PROJECT_ID)
+        specs = json.loads(env["PIPELINES_JSON"])
+        self.assertEqual(
+            specs,
+            [
+                {
+                    "id": 42,
+                    "name": "GHA-owner-repo-ci",
+                    "yaml": "github-to-azdo-abc/ci.yml",
+                }
+            ],
+        )
+        self.assertIn("contents: read", text)
+        self.assertIn("secrets.AZURE_DEVOPS_EXT_PAT", text)
+
+    def test_pipeline_branch_mismatch_fails_before_finalizer(self):
+        gh = FakeGitHub(default_responses())
+        az = FakeAzure(
+            pipeline_overrides={
+                101: {"repository": {"defaultBranch": "refs/heads/main"}}
+            }
+        )
+        status, error, _out, _err = run_transfer_captured(
+            ["1", "1", "1", "1", "PUBLISH"],
+            gh,
+            az,
+            org="testorg",
+        )
+        self.assertIsNone(status)
+        self.assertIn("did not retain the requested YAML location", str(error))
+        self.assertIn("GHA-owner-repo-ci (id 101)", str(error))
+        self.assertIn("post-merge workflow: not configured", str(error))
+        self.assertEqual(len(gh.post_calls), 4)
+        self.assertEqual(gh.patch_calls, [])
 
     def test_plan_mode_makes_no_writes(self):
         gh = FakeGitHub(default_responses())
@@ -656,6 +800,36 @@ jobs:
         # Only the safe workflow was listed for selection.
         self.assertEqual(len(az.create_calls), 0)
 
+    def test_generated_finalizer_workflow_is_skipped(self):
+        finalizer_entry = {
+            "name": f"gh-to-azdo-finalize-{'a' * 32}.yml",
+            "path": f".github/workflows/gh-to-azdo-finalize-{'a' * 32}.yml",
+            "sha": BLOB_SHA,
+            "type": "file",
+            "size": 10,
+        }
+        good_entry = {
+            "name": "ci.yml",
+            "path": ".github/workflows/ci.yml",
+            "sha": BLOB_SHA_2,
+            "type": "file",
+            "size": 10,
+            "_text": WORKFLOW,
+        }
+        gh = FakeGitHub(
+            default_responses(workflows=[finalizer_entry, good_entry])
+        )
+        az = FakeAzure()
+        status, _error, _out, err = run_transfer_captured(
+            ["1", "1", "1", "1"], gh, az, org="testorg", plan_only=True
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("generated post-merge helper", err)
+        blob_endpoints = [
+            endpoint for endpoint, _ in gh.get_calls if "git/blobs" in endpoint
+        ]
+        self.assertEqual(blob_endpoints, [f"repos/owner/repo/git/blobs/{BLOB_SHA_2}"])
+
     def test_repo_without_push_access_is_filtered(self):
         responses = default_responses()
         repos_endpoint = next(
@@ -715,6 +889,23 @@ class TestAdapters(unittest.TestCase):
             self.assertIn(flag, argv)
             if expected is not None:
                 self.assertEqual(argv[argv.index(flag) + 1], expected)
+
+    def test_azure_pipeline_show_argv(self):
+        az = transfer.Azure()
+        with mock.patch.object(transfer, "_run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=json.dumps({"id": 7}), stderr=""
+            )
+            result = az.pipeline("testorg", PROJECT_ID, 7)
+        self.assertEqual(result["id"], 7)
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[1:3], ["pipelines", "show"])
+        self.assertEqual(argv[argv.index("--id") + 1], "7")
+        self.assertEqual(
+            argv[argv.index("--organization") + 1],
+            "https://dev.azure.com/testorg",
+        )
+        self.assertEqual(argv[argv.index("--project") + 1], PROJECT_ID)
 
     def test_azure_project_list_args_and_no_project_flag(self):
         az = transfer.Azure()
@@ -870,6 +1061,21 @@ class TestAdapters(unittest.TestCase):
         self.assertIn("-", argv)
         self.assertEqual(run.call_args[1]["input_text"], '{"draft": true}')
 
+    def test_github_patch_uses_input_stdin(self):
+        gh = transfer.GitHub()
+        with mock.patch.object(transfer, "_run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="{}", stderr=""
+            )
+            gh.patch("repos/o/r/git/refs/heads/x", {"sha": HEAD, "force": False})
+        argv = run.call_args[0][0]
+        self.assertIn("PATCH", argv)
+        self.assertIn("--input", argv)
+        self.assertEqual(
+            run.call_args[1]["input_text"],
+            json.dumps({"sha": HEAD, "force": False}),
+        )
+
     def test_api_error_does_not_leak_stderr_token(self):
         gh = transfer.GitHub()
         with mock.patch.object(transfer, "_run") as run:
@@ -989,7 +1195,11 @@ class TestCliRouting(unittest.TestCase):
             status = cli.main(["transfer", "--org", "o", "--plan"])
         self.assertEqual(status, 0)
         rt.assert_called_once_with(
-            org="o", target=None, plan_only=True, license_path=None
+            org="o",
+            target=None,
+            plan_only=True,
+            license_path=None,
+            post_merge_switch=True,
         )
 
     def test_transfer_target_routes_through_cli(self):
@@ -1000,7 +1210,27 @@ class TestCliRouting(unittest.TestCase):
             status = cli.main(["transfer", "--target", target, "--plan"])
         self.assertEqual(status, 0)
         rt.assert_called_once_with(
-            org=None, target=target, plan_only=True, license_path=None
+            org=None,
+            target=target,
+            plan_only=True,
+            license_path=None,
+            post_merge_switch=True,
+        )
+
+    def test_transfer_post_merge_opt_out_routes_through_cli(self):
+        from github_to_azdo import cli
+
+        with mock.patch.object(transfer, "run_transfer", return_value=0) as rt:
+            status = cli.main(
+                ["transfer", "--org", "o", "--plan", "--no-post-merge-switch"]
+            )
+        self.assertEqual(status, 0)
+        rt.assert_called_once_with(
+            org="o",
+            target=None,
+            plan_only=True,
+            license_path=None,
+            post_merge_switch=False,
         )
 
     def test_transfer_error_becomes_cli_error(self):

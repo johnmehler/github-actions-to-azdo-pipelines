@@ -34,3 +34,5 @@ jobs:
         run: Write-Output 'Build step placeholder'
       - name: Smoke check
         run: echo done
+variables:
+  - group: deployment-variables

@@ -91,7 +91,7 @@ YAML, then import or commit it through your normal Azure Repos flow.
 ## Transferring workflows to Azure DevOps (`transfer`)
 
 ```bash
-gh-to-azdo transfer [--target URL | --org NAME] [--plan] [--license license.json]
+gh-to-azdo transfer [--target URL | --org NAME] [--plan] [--license license.json] [--no-post-merge-switch]
 ```
 
 `transfer` is the only command that contacts remotes. It drives the local
@@ -132,8 +132,22 @@ Publishing writes, in order:
    default branch directly.
 3. One Azure pipeline definition per file, created against the new
    `gh-to-azdo/<id>` branch via `--yml-path` with `--skip-first-run true`.
-   This branch already contains the generated YAML, so the pipeline can be
-   run as soon as it is imported; the command itself never queues a run.
+   The importer reads the definition back and verifies that Azure retained the
+   migration branch and YAML path. This branch already contains the generated
+   YAML, so the pipeline can be run as soon as it is imported; the command
+   itself never queues a run.
+4. A second commit on the same branch adds
+   `.github/workflows/gh-to-azdo-finalize-<id>.yml`. After the PR merges, that
+   path-filtered workflow verifies the generated YAML exists on the repository
+   default branch and updates each Azure pipeline default branch back to
+   `refs/heads/<default>`; later transfer scans ignore the helper. Use
+   `--no-post-merge-switch` to leave that step manual.
+
+The finalizer needs a GitHub repository secret named `AZURE_DEVOPS_EXT_PAT`
+containing an Azure DevOps PAT for a user allowed to edit build definitions
+(Build — Read & Execute scope). The value is never requested or printed by
+`gh-to-azdo`; if the secret is absent, the post-merge workflow fails without
+changing the pipeline and can be rerun after the secret is added.
 
 `--plan` performs all reads and previews the selections and the
 file→pipeline mapping without any writes (sign-in still happens) — it is
@@ -158,8 +172,10 @@ Honest limitations:
   manually.
 - The imported pipeline initially uses the `gh-to-azdo/<id>` branch as its
   default branch so Azure can find the YAML before the draft PR is merged.
-  After merging the PR, change the pipeline's default branch to the repository
-  default branch if you want manual and scheduled runs to use it.
+  The generated finalizer switches it to the repository default branch after
+  merge when `AZURE_DEVOPS_EXT_PAT` is configured; otherwise rerun that
+  workflow or switch it manually. Use `--no-post-merge-switch` to omit the
+  finalizer.
 - The command never queues a first run, but automatic triggers **may** apply
   as soon as the YAML is present on a watched branch — the new branch and the
   draft PR itself can trigger existing GitHub automation. Test the generated

@@ -304,6 +304,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="signed Pro license file (required to publish more than one "
         "workflow; planning is free)",
     )
+    transfer.add_argument(
+        "--no-post-merge-switch",
+        action="store_true",
+        help="do not add the workflow that switches pipeline default branches "
+        "to the repository default branch after the draft PR merges",
+    )
     return parser
 
 
@@ -332,6 +338,7 @@ def main(argv: list[str] | None = None) -> int:
                     target=args.target,
                     plan_only=args.plan,
                     license_path=Path(args.license) if args.license else None,
+                    post_merge_switch=not args.no_post_merge_switch,
                 )
             except TransferError as exc:
                 raise _CliError(str(exc)) from exc

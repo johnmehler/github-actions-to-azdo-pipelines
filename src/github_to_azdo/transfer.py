@@ -5,9 +5,11 @@ the locally installed ``gh`` and ``az`` CLIs: GitHub stays the source of truth
 (code is never copied), converted Azure Pipelines YAML is committed on a new
 ``gh-to-azdo/<id>`` branch behind a **draft** pull request, and Azure pipeline
 definitions use that branch so the YAML is available as soon as each pipeline
-is imported.  First-run queueing is disabled.  Existing GitHub Actions
-workflows are never disabled or deleted, the default branch is never written
-directly, and no pipeline run is triggered by the command itself.
+is imported.  The draft PR also contains a post-merge workflow that switches
+pipeline default branches back to the repository default branch after merging.
+First-run queueing is disabled.  Existing GitHub Actions workflows are never
+disabled or deleted, the default branch is never written directly, and no
+pipeline run is triggered by the command itself.
 """
 
 from __future__ import annotations
@@ -36,6 +38,9 @@ _REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+")
 _BRANCH_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
 _ORG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,49}")
 _WORKFLOW_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:yml|yaml)", re.IGNORECASE)
+_FINALIZER_NAME_RE = re.compile(
+    r"gh-to-azdo-finalize-[0-9a-f]{32}\.yml", re.IGNORECASE
+)
 _PIPELINE_NAME_RE = re.compile(r"[A-Za-z0-9_.-]+")
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 _HTTP_RE = re.compile(r"HTTP (\d{3})")
@@ -231,6 +236,14 @@ class GitHub:
         except json.JSONDecodeError as exc:
             raise TransferError("GitHub API returned unreadable JSON") from exc
 
+    def patch(self, endpoint: str, body: dict[str, Any]) -> Any:
+        try:
+            return json.loads(
+                self._api(["--method", "PATCH", endpoint, "--input", "-"], input_text=json.dumps(body))
+            )
+        except json.JSONDecodeError as exc:
+            raise TransferError("GitHub API returned unreadable JSON") from exc
+
 
 # ---------------------------------------------------------------------------
 # Azure DevOps adapter (az CLI)
@@ -378,6 +391,18 @@ class Azure:
             for pipe in _list_items(data, "pipeline")
             if str(pipe.get("name", "")).casefold() == wanted
         ]
+
+    def pipeline(self, org: str, project: str, pipeline_id: int) -> dict[str, Any]:
+        data = self._az_json(
+            ["pipelines", "show", "--id", str(pipeline_id)],
+            org=org,
+            project=project,
+        )
+        if not isinstance(data, dict) or data.get("id") != pipeline_id:
+            raise TransferError(
+                "Azure DevOps did not return the created pipeline definition"
+            )
+        return data
 
     def create_pipeline(
         self,
@@ -608,6 +633,9 @@ def _list_workflows(
             continue
         if not _WORKFLOW_NAME_RE.fullmatch(name):
             skipped.append(f"{display} (name is not a safe pipeline identifier)")
+            continue
+        if _FINALIZER_NAME_RE.fullmatch(name):
+            skipped.append(f"{display} (generated post-merge helper)")
             continue
         sha = entry.get("sha")
         if not isinstance(sha, str) or not _SHA_RE.fullmatch(sha):
@@ -943,12 +971,275 @@ def _state_note(branch: str, state: dict[str, Any]) -> str:
         ", ".join(f"{name} (id {pid})" for name, pid in pipelines)
         or "none confirmed"
     )
+    finalizer = "configured" if state.get("finalizer") else "not configured"
     return (
         f"partial state: branch '{branch}' "
         + ("exists" if state["ref"] else "may exist (a timed-out request may still have created it)")
-        + f"; PR: {pr}; confirmed Azure pipelines: {pipeline_text}. "
+        + f"; PR: {pr}; confirmed Azure pipelines: {pipeline_text}; "
+        f"post-merge workflow: {finalizer}. "
         "Check both GitHub and Azure DevOps before rerunning — nothing is "
         "retried or deleted automatically"
+    )
+
+
+def _verify_pipeline_config(
+    data: dict[str, Any], *, branch: str, path: str, name: str
+) -> None:
+    repository = data.get("repository")
+    process = data.get("process")
+    actual_branch = (
+        repository.get("defaultBranch") if isinstance(repository, dict) else None
+    )
+    actual_path = (
+        process.get("yamlFilename") if isinstance(process, dict) else None
+    )
+    if actual_branch != branch or actual_path != path:
+        shown_branch = _clean_remote(actual_branch or "unknown")
+        shown_path = _clean_remote(actual_path or "unknown")
+        raise TransferError(
+            f"Azure pipeline '{name}' did not retain the requested YAML "
+            f"location (expected {branch} at {path}; found {shown_branch} "
+            f"at {shown_path})"
+        )
+
+
+def _post_merge_workflow(
+    *,
+    repo: str,
+    branch: str,
+    default_branch: str,
+    org: str,
+    project_id: str,
+    transfer_id: str,
+    pipelines: list[tuple[int, PipelineFile]],
+) -> tuple[str, str]:
+    """Return path and content for the post-merge Azure branch fix-up."""
+    path = f".github/workflows/gh-to-azdo-finalize-{transfer_id}.yml"
+    target_ref = f"refs/heads/{default_branch}"
+    specs = [
+        {"id": pipeline_id, "name": pipeline.name, "yaml": pipeline.path}
+        for pipeline_id, pipeline in pipelines
+    ]
+    pipelines_json = json.dumps(specs, separators=(",", ":"))
+    branch_json = json.dumps(default_branch)
+    path_json = json.dumps(path)
+    workflow = f"""\
+name: gh-to-azdo post-merge {transfer_id}
+
+on:
+  push:
+    branches: [{branch_json}]
+    paths: [{path_json}]
+  pull_request:
+    types: [closed]
+    branches: [{branch_json}]
+    paths: [{path_json}]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gh-to-azdo-finalize-{transfer_id}
+  cancel-in-progress: false
+
+jobs:
+  update-pipeline-default-branch:
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.merged == true &&
+       github.event.pull_request.head.ref == '{branch}')
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{{{ github.token }}}}
+      GH_REPO: {repo}
+      AZURE_DEVOPS_EXT_PAT: ${{{{ secrets.AZURE_DEVOPS_EXT_PAT }}}}
+      AZURE_ORG_URL: https://dev.azure.com/{org}
+      AZURE_PROJECT: {project_id}
+      TARGET_REF: {target_ref}
+      PIPELINES_JSON: '{pipelines_json}'
+    steps:
+      - name: Verify and update Azure Pipelines
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import base64
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+
+          def fail(message):
+              raise SystemExit(message)
+
+
+          def response_json(request, service):
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as exc:
+                  exc.read()
+                  fail(f"{{service}} request failed with HTTP {{exc.code}}")
+              except (urllib.error.URLError, OSError) as exc:
+                  fail(f"{{service}} request failed: {{exc}}")
+              except json.JSONDecodeError:
+                  fail(f"{{service}} returned unreadable JSON")
+
+
+          def github_file_exists(url, headers):
+              request = urllib.request.Request(url, headers=headers)
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      payload = json.load(response)
+              except urllib.error.HTTPError as exc:
+                  exc.read()
+                  if exc.code == 404:
+                      return False
+                  fail(f"GitHub request failed with HTTP {{exc.code}}")
+              except (urllib.error.URLError, OSError) as exc:
+                  fail(f"GitHub request failed: {{exc}}")
+              except json.JSONDecodeError:
+                  fail("GitHub returned unreadable JSON")
+              return isinstance(payload, dict) and payload.get("type") == "file"
+
+
+          def azure_request(url, headers, body=None):
+              request_headers = dict(headers)
+              data = None
+              method = "GET"
+              if body is not None:
+                  request_headers["Content-Type"] = "application/json"
+                  data = json.dumps(body).encode("utf-8")
+                  method = "PUT"
+              request = urllib.request.Request(
+                  url, data=data, headers=request_headers, method=method
+              )
+              return response_json(request, "Azure DevOps")
+
+
+          pat = os.environ.get("AZURE_DEVOPS_EXT_PAT", "").strip()
+          if not pat:
+              fail(
+                  "AZURE_DEVOPS_EXT_PAT is not configured as a GitHub secret; "
+                  "add an Azure DevOps PAT allowed to edit build definitions, "
+                  "then rerun this workflow"
+              )
+          gh_token = os.environ.get("GH_TOKEN", "")
+          if not gh_token:
+              fail("GITHUB_TOKEN is unavailable; cannot verify the merged YAML")
+
+          repo = os.environ["GH_REPO"]
+          org_url = os.environ["AZURE_ORG_URL"].rstrip("/")
+          project = os.environ["AZURE_PROJECT"]
+          target_ref = os.environ["TARGET_REF"]
+          target_branch = target_ref.removeprefix("refs/heads/")
+          if target_branch == target_ref:
+              fail("TARGET_REF must be a refs/heads/ branch")
+          pipelines = json.loads(os.environ["PIPELINES_JSON"])
+
+          github_headers = {{
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {{gh_token}}",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }}
+          encoded_branch = urllib.parse.quote(target_branch, safe="")
+          missing = []
+          for pipeline in pipelines:
+              yaml_path = pipeline["yaml"]
+              encoded_path = "/".join(
+                  urllib.parse.quote(part, safe="")
+                  for part in yaml_path.split("/")
+              )
+              url = (
+                  f"https://api.github.com/repos/{{repo}}/contents/"
+                  f"{{encoded_path}}?ref={{encoded_branch}}"
+              )
+              if not github_file_exists(url, github_headers):
+                  missing.append(yaml_path)
+          if missing:
+              fail(
+                  "generated Azure YAML is not on the target branch yet: "
+                  + ", ".join(missing)
+              )
+
+          azure_token = base64.b64encode(f":{{pat}}".encode("utf-8")).decode("ascii")
+          azure_headers = {{
+              "Accept": "application/json",
+              "Authorization": f"Basic {{azure_token}}",
+          }}
+          for pipeline in pipelines:
+              pipeline_id = int(pipeline["id"])
+              yaml_path = pipeline["yaml"]
+              url = (
+                  f"{{org_url}}/{{project}}/_apis/build/definitions/"
+                  f"{{pipeline_id}}?api-version=7.1"
+              )
+              definition = azure_request(url, azure_headers)
+              repository = definition.get("repository")
+              process = definition.get("process")
+              if not isinstance(repository, dict) or not isinstance(process, dict):
+                  fail(f"Azure DevOps returned an incomplete definition for {{pipeline_id}}")
+              current_branch = repository.get("defaultBranch")
+              current_path = process.get("yamlFilename")
+              if current_branch != target_ref or current_path != yaml_path:
+                  repository["defaultBranch"] = target_ref
+                  process["yamlFilename"] = yaml_path
+                  azure_request(url, azure_headers, definition)
+                  refreshed = azure_request(url, azure_headers)
+                  refreshed_repository = refreshed.get("repository") or {{}}
+                  refreshed_process = refreshed.get("process") or {{}}
+                  if (
+                      refreshed_repository.get("defaultBranch") != target_ref
+                      or refreshed_process.get("yamlFilename") != yaml_path
+                  ):
+                      fail(f"Azure DevOps did not retain the update for {{pipeline_id}}")
+              print(f"{{pipeline['name']}} (id {{pipeline_id}}): {{target_ref}}")
+          PY
+"""
+    return path, workflow
+
+
+def _push_post_merge_workflow(
+    gh: GitHub,
+    repo: str,
+    *,
+    branch: str,
+    commit_sha: str,
+    tree_sha: str,
+    path: str,
+    content: str,
+) -> None:
+    tree = gh.post(
+        f"repos/{repo}/git/trees",
+        {
+            "base_tree": tree_sha,
+            "tree": [
+                {
+                    "path": path,
+                    "mode": "100644",
+                    "type": "blob",
+                    "content": content,
+                }
+            ],
+        },
+    )
+    new_tree = _sha_of(tree, "post-merge tree")
+    commit = gh.post(
+        f"repos/{repo}/git/commits",
+        {
+            "message": "Add post-merge Azure pipeline branch update",
+            "tree": new_tree,
+            "parents": [commit_sha],
+        },
+    )
+    new_commit = _sha_of(commit, "post-merge commit")
+    quoted_branch = urllib.parse.quote(branch, safe="/")
+    gh.patch(
+        f"repos/{repo}/git/refs/heads/{quoted_branch}",
+        {"sha": new_commit, "force": False},
     )
 
 
@@ -961,13 +1252,20 @@ def _publish_all(
     head_sha: str,
     base_tree: str,
     branch: str,
+    transfer_id: str,
     files: list[PipelineFile],
     org: str,
     project_id: str,
     connection_id: str,
+    post_merge_switch: bool,
 ) -> str:
     """Perform every remote write; report retained state on failure."""
-    state: dict[str, Any] = {"ref": False, "pr_url": None, "pipelines": []}
+    state: dict[str, Any] = {
+        "ref": False,
+        "pr_url": None,
+        "pipelines": [],
+        "finalizer": False,
+    }
     try:
         tree = gh.post(
             f"repos/{repo}/git/trees",
@@ -1001,6 +1299,16 @@ def _publish_all(
         state["ref"] = True
         print(f"pushed branch {branch}", file=sys.stderr)
 
+        pr_body = (
+            "Review the generated Azure Pipelines YAML before merging. "
+            "Existing GitHub Actions workflows are unchanged."
+        )
+        if post_merge_switch:
+            pr_body += (
+                " A generated post-merge workflow updates the imported "
+                "pipeline default branch after merge; it requires the "
+                "AZURE_DEVOPS_EXT_PAT repository secret."
+            )
         pr = gh.post(
             f"repos/{repo}/pulls",
             {
@@ -1008,10 +1316,7 @@ def _publish_all(
                 "head": branch,
                 "base": default_branch,
                 "draft": True,
-                "body": (
-                    "Review the generated Azure Pipelines YAML before "
-                    "merging. Existing GitHub Actions workflows are unchanged."
-                ),
+                "body": pr_body,
             },
         )
         number = pr.get("number") if isinstance(pr, dict) else None
@@ -1022,23 +1327,54 @@ def _publish_all(
         state["pr_url"] = pr_url
         print(f"draft pull request: {pr_url}", file=sys.stderr)
 
+        created: list[tuple[int, PipelineFile]] = []
+        pipeline_ref = f"refs/heads/{branch}"
         for pipeline_file in files:
             result = azure.create_pipeline(
                 org,
                 project_id,
                 connection_id,
                 repo,
-                f"refs/heads/{branch}",
+                pipeline_ref,
                 pipeline_file,
             )
             pipeline_id = result["id"]
             state["pipelines"].append((pipeline_file.name, pipeline_id))
+            _verify_pipeline_config(
+                azure.pipeline(org, project_id, pipeline_id),
+                branch=pipeline_ref,
+                path=pipeline_file.path,
+                name=pipeline_file.name,
+            )
+            created.append((pipeline_id, pipeline_file))
             print(
                 f"created Azure pipeline '{pipeline_file.name}' "
                 f"(id {pipeline_id}): "
                 f"https://dev.azure.com/{org}/{project_id}/_build?definitionId={pipeline_id}",
                 file=sys.stderr,
             )
+
+        if post_merge_switch:
+            finalizer_path, finalizer = _post_merge_workflow(
+                repo=repo,
+                branch=branch,
+                default_branch=default_branch,
+                org=org,
+                project_id=project_id,
+                transfer_id=transfer_id,
+                pipelines=created,
+            )
+            _push_post_merge_workflow(
+                gh,
+                repo,
+                branch=branch,
+                commit_sha=commit_sha,
+                tree_sha=tree_sha,
+                path=finalizer_path,
+                content=finalizer,
+            )
+            state["finalizer"] = True
+            print("added post-merge branch update workflow", file=sys.stderr)
     except TransferError as exc:
         raise TransferError(f"{exc} [{_state_note(branch, state)}]") from exc
     except KeyboardInterrupt as exc:
@@ -1059,6 +1395,7 @@ def _transfer(
     target: str | None,
     plan_only: bool,
     license_path: Path | None,
+    post_merge_switch: bool,
 ) -> int:
     if org is not None and target is not None:
         raise TransferError("pass either --org or --target, not both")
@@ -1168,6 +1505,13 @@ def _transfer(
         f"  pipelines:   one per file on refs/heads/{branch} "
         "(YAML is available immediately; first run is not queued)"
     )
+    if post_merge_switch:
+        print(
+            "  post-merge:  workflow switches pipeline default branch to "
+            f"refs/heads/{default_branch} (requires AZURE_DEVOPS_EXT_PAT)"
+        )
+    else:
+        print("  post-merge:  switch the pipeline default branch manually")
     print(
         "  unchanged:   existing GitHub Actions workflows are not disabled; "
         "configure secrets, branch policies and runner availability in "
@@ -1217,15 +1561,28 @@ def _transfer(
         head_sha=head_sha,
         base_tree=base_tree,
         branch=branch,
+        transfer_id=transfer_id,
         files=files,
         org=org_name,
         project_id=project_id,
         connection_id=connection_id,
+        post_merge_switch=post_merge_switch,
     )
+    if post_merge_switch:
+        post_merge_note = (
+            "The generated post-merge workflow will switch each pipeline "
+            f"default branch to refs/heads/{default_branch}; it requires "
+            "the AZURE_DEVOPS_EXT_PAT repository secret."
+        )
+    else:
+        post_merge_note = (
+            "After merging, change each pipeline default branch to "
+            f"refs/heads/{default_branch} if needed."
+        )
     print(
         "\nDone. Azure pipelines point at the migration branch containing the "
-        "YAML. Merge the draft PR to add it to the default branch; then change "
-        f"the pipeline default branch to refs/heads/{default_branch} if needed. "
+        "YAML and can be run on that branch immediately. Merge the draft PR "
+        f"to add the YAML to the default branch. {post_merge_note} "
         "No runs were queued by this command."
     )
     return 0
@@ -1237,6 +1594,7 @@ def run_transfer(
     target: str | None = None,
     plan_only: bool = False,
     license_path: Path | None = None,
+    post_merge_switch: bool = True,
 ) -> int:
     """Run the interactive GitHub -> Azure DevOps transfer."""
     try:
@@ -1245,6 +1603,7 @@ def run_transfer(
             target=target,
             plan_only=plan_only,
             license_path=license_path,
+            post_merge_switch=post_merge_switch,
         )
     except _Abort:
         print("transfer cancelled; nothing was published", file=sys.stderr)
