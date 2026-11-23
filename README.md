@@ -445,5 +445,3 @@ python -m github_to_azdo dry-run examples/ci.yml
 
 `tools/issue_license.py` is vendor-side only and is not part of the installed
 package.
-#   g i t h u b - a c t i o n s - t o - a z d o - p i p e l i n e s  
- 
