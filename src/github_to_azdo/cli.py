@@ -1,9 +1,9 @@
 """Command line interface for ``gh-to-azdo``.
 
 Subcommands: ``audit``, ``dry-run``, ``migrate`` and ``batch`` work fully
-offline; ``transfer`` is the only command that contacts GitHub and Azure
-DevOps (via the local ``gh`` and ``az`` CLIs).  The tool never executes
-workflow code.
+offline; ``transfer``, ``apply`` and ``destroy`` contact GitHub and Azure
+DevOps via the local ``gh`` and ``az`` CLIs. The tool never executes workflow
+code.
 """
 
 from __future__ import annotations
@@ -228,9 +228,8 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="gh-to-azdo",
         description=(
             "Convert supported GitHub Actions workflows to Azure Pipelines YAML. "
-            "audit/dry-run/migrate/batch are offline; transfer signs in via the "
-            "local gh and az CLIs and publishes a draft PR plus pipeline "
-            "definitions. The tool never executes workflow code."
+            "audit/dry-run/migrate/batch are offline; transfer/apply/destroy use "
+            "the local gh and az CLIs. The tool never executes workflow code."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -300,6 +299,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="preview selected workflows without publishing or requiring a license",
     )
     transfer.add_argument(
+        "--output",
+        metavar="FILE",
+        help="save a reusable JSON plan (requires --plan; file must not exist)",
+    )
+    transfer.add_argument(
         "--license",
         help="signed Pro license file (required to publish more than one "
         "workflow; planning is free)",
@@ -310,6 +314,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="do not add the workflow that switches pipeline default branches "
         "to the repository default branch after the draft PR merges",
     )
+
+    apply = subparsers.add_parser(
+        "apply", help="apply a saved transfer plan after revalidating its inputs"
+    )
+    apply.add_argument("plan", help="JSON plan created by transfer --plan --output")
+    apply.add_argument("--license", help="signed Pro license file for multiple workflows")
+    apply.add_argument(
+        "--destroy",
+        action="store_true",
+        help="destroy the applied transfer recorded for this plan",
+    )
+
+    destroy = subparsers.add_parser(
+        "destroy", help="destroy only resources recorded for an applied plan"
+    )
+    destroy.add_argument("plan", help="JSON plan previously applied")
     return parser
 
 
@@ -338,7 +358,20 @@ def main(argv: list[str] | None = None) -> int:
                     target=args.target,
                     plan_only=args.plan,
                     license_path=Path(args.license) if args.license else None,
+                    plan_output=Path(args.output) if args.output else None,
                     post_merge_switch=not args.no_post_merge_switch,
+                )
+            except TransferError as exc:
+                raise _CliError(str(exc)) from exc
+        if args.command in {"apply", "destroy"}:
+            from .transfer import TransferError, run_apply, run_destroy
+
+            try:
+                if args.command == "destroy" or args.destroy:
+                    return run_destroy(Path(args.plan))
+                return run_apply(
+                    Path(args.plan),
+                    license_path=Path(args.license) if args.license else None,
                 )
             except TransferError as exc:
                 raise _CliError(str(exc)) from exc

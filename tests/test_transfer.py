@@ -65,6 +65,8 @@ class FakeGitHub:
         self.get_calls: list[tuple[str, bool]] = []
         self.post_calls: list[tuple[str, dict]] = []
         self.patch_calls: list[tuple[str, dict]] = []
+        self.delete_calls: list[str] = []
+        self.pull_requests: dict[int, dict] = {}
 
     def authenticate(self) -> str:
         return self.login
@@ -72,6 +74,9 @@ class FakeGitHub:
     def get(self, endpoint: str, *, paginate: bool = False):
         self.get_calls.append((endpoint, paginate))
         value = self.responses.get(endpoint, _MISSING)
+        if value is _MISSING and endpoint.startswith("repos/owner/repo/pulls/"):
+            number = int(endpoint.rsplit("/", 1)[-1])
+            value = self.pull_requests.get(number, _MISSING)
         if value is _MISSING:
             raise AssertionError(f"unexpected GET {endpoint}")
         if callable(value):
@@ -84,12 +89,52 @@ class FakeGitHub:
         if value is _MISSING:
             raise AssertionError(f"unexpected POST {endpoint}")
         if callable(value):
-            return value(endpoint, body)
+            value = value(endpoint, body)
+        if endpoint == "repos/owner/repo/git/refs":
+            branch = body["ref"].removeprefix("refs/heads/")
+            self.responses[
+                f"repos/owner/repo/git/ref/heads/{branch}"
+            ] = {"object": {"sha": body["sha"]}}
+        if endpoint == "repos/owner/repo/pulls":
+            self.pull_requests[42] = {
+                "number": 42,
+                "state": "open",
+                "draft": True,
+                "merged": False,
+                "head": {
+                    "ref": body["head"],
+                    "sha": self.responses[
+                        f"repos/owner/repo/git/ref/heads/{body['head']}"
+                    ]["object"]["sha"],
+                },
+                "base": {"ref": body["base"]},
+            }
         return value
 
     def patch(self, endpoint: str, body: dict):
         self.patch_calls.append((endpoint, body))
+        if endpoint.startswith("repos/owner/repo/git/refs/heads/"):
+            branch = endpoint.removeprefix("repos/owner/repo/git/refs/heads/")
+            self.responses[
+                f"repos/owner/repo/git/ref/heads/{branch}"
+            ] = {"object": {"sha": body["sha"]}}
+            for pr in self.pull_requests.values():
+                if pr["head"]["ref"] == branch:
+                    pr["head"]["sha"] = body["sha"]
+        elif endpoint.startswith("repos/owner/repo/pulls/"):
+            number = int(endpoint.rsplit("/", 1)[-1])
+            self.pull_requests[number]["state"] = body.get(
+                "state", self.pull_requests[number]["state"]
+            )
         return {}
+
+    def delete(self, endpoint: str):
+        self.delete_calls.append(endpoint)
+        if endpoint.startswith("repos/owner/repo/git/refs/heads/"):
+            branch = endpoint.removeprefix("repos/owner/repo/git/refs/heads/")
+            self.responses.pop(
+                f"repos/owner/repo/git/ref/heads/{branch}", None
+            )
 
 
 _MISSING = object()
@@ -125,6 +170,7 @@ class FakeAzure:
         self.authenticated = False
         self.create_calls: list[dict] = []
         self.pipeline_calls: list[tuple[str, str, int]] = []
+        self.delete_calls: list[tuple[str, str, int]] = []
 
     def authenticate(self) -> None:
         self.authenticated = True
@@ -155,7 +201,13 @@ class FakeAzure:
         pipeline_id = 100 + self._create_count
         self._definitions[pipeline_id] = {
             "id": pipeline_id,
-            "repository": {"defaultBranch": branch},
+            "name": pipeline.name,
+            "repository": {
+                "defaultBranch": branch,
+                "name": repo,
+                "type": "github",
+                "url": f"https://github.com/{repo}",
+            },
             "process": {"yamlFilename": pipeline.path},
         }
         return {"id": pipeline_id}
@@ -165,11 +217,16 @@ class FakeAzure:
         source = self._definitions[pipeline_id]
         detail = {
             "id": source["id"],
+            "name": source["name"],
             "repository": dict(source["repository"]),
             "process": dict(source["process"]),
         }
         detail.update(self._pipeline_overrides.get(pipeline_id, {}))
         return detail
+
+    def delete_pipeline(self, org, project, pipeline_id):
+        self.delete_calls.append((org, project, pipeline_id))
+        self._definitions.pop(pipeline_id, None)
 
 
 def default_responses(workflow_text: str = WORKFLOW, workflows=None):
@@ -202,7 +259,12 @@ def default_responses(workflow_text: str = WORKFLOW, workflows=None):
             ]
         ],
         "user": {"login": "testuser"},
-        "repos/owner/repo": {"default_branch": "main"},
+        "repos/owner/repo": {
+            "default_branch": "main",
+            "archived": False,
+            "disabled": False,
+            "permissions": {"push": True},
+        },
         "repos/owner/repo/git/ref/heads/main": {"object": {"sha": HEAD}},
         f"repos/owner/repo/contents/.github/workflows?ref={HEAD}": entries,
         **{
@@ -852,6 +914,214 @@ jobs:
         self.assertIn("push access", str(error))
 
 
+def run_apply_captured(inputs, plan_path, gh, az, *, license_path=None):
+    out, err = io.StringIO(), io.StringIO()
+    status, error = None, None
+    with mock.patch("builtins.input", side_effect=inputs), \
+        mock.patch.object(transfer, "GitHub", return_value=gh), \
+        mock.patch.object(transfer, "Azure", return_value=az), \
+        redirect_stdout(out), redirect_stderr(err):
+        try:
+            status = transfer.run_apply(plan_path, license_path=license_path)
+        except TransferError as exc:
+            error = exc
+    return status, error, out.getvalue(), err.getvalue()
+
+
+def run_destroy_captured(inputs, plan_path, gh, az):
+    out, err = io.StringIO(), io.StringIO()
+    status, error = None, None
+    with mock.patch("builtins.input", side_effect=inputs), \
+        mock.patch.object(transfer, "GitHub", return_value=gh), \
+        mock.patch.object(transfer, "Azure", return_value=az), \
+        redirect_stdout(out), redirect_stderr(err):
+        try:
+            status = transfer.run_destroy(plan_path)
+        except TransferError as exc:
+            error = exc
+    return status, error, out.getvalue(), err.getvalue()
+
+
+def create_saved_plan(tmp_path, gh, az):
+    plan_path = Path(tmp_path) / "cloudjobs.plan.json"
+    status, error, _out, err = run_transfer_captured(
+        ["1", "1", "1", "1"],
+        gh,
+        az,
+        org="testorg",
+        plan_only=True,
+        plan_output=plan_path,
+    )
+    if error is not None or status != 0:
+        raise AssertionError(f"plan creation failed: {error or err}")
+    return plan_path
+
+
+class TestSavedTransferPlans(unittest.TestCase):
+    def test_plan_outfile_is_reusable_and_read_only(self):
+        gh = FakeGitHub(default_responses())
+        az = FakeAzure()
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = create_saved_plan(tmp, gh, az)
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            self.assertEqual(plan["format"], transfer._PLAN_FORMAT)
+            self.assertEqual(plan["source"]["repository"], "owner/repo")
+            self.assertEqual(plan["destination"]["project_id"], PROJECT_ID)
+            self.assertEqual(len(plan["pipelines"]), 1)
+            self.assertEqual(gh.post_calls, [])
+            self.assertEqual(az.create_calls, [])
+            self.assertFalse(transfer._receipt_path(plan_path).exists())
+
+    def test_plan_outfile_refuses_to_overwrite(self):
+        gh = FakeGitHub(default_responses())
+        az = FakeAzure()
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = Path(tmp) / "existing.json"
+            plan_path.write_text("keep me", encoding="utf-8")
+            status, error, _out, _err = run_transfer_captured(
+                ["1", "1", "1", "1"],
+                gh,
+                az,
+                org="testorg",
+                plan_only=True,
+                plan_output=plan_path,
+            )
+            self.assertIsNone(status)
+            self.assertIn("refusing to overwrite", str(error))
+            self.assertEqual(plan_path.read_text(encoding="utf-8"), "keep me")
+            self.assertEqual(gh.post_calls, [])
+            self.assertEqual(az.create_calls, [])
+
+    def test_apply_receipt_can_destroy_only_created_resources(self):
+        gh = FakeGitHub(default_responses())
+        az = FakeAzure()
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = create_saved_plan(tmp, gh, az)
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            status, error, _out, _err = run_apply_captured(
+                ["PUBLISH"], plan_path, gh, az
+            )
+            self.assertIsNone(error)
+            self.assertEqual(status, 0)
+            receipt_path = transfer._receipt_path(plan_path)
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["status"], "applied")
+            self.assertEqual(len(receipt["pipelines"]), 1)
+            self.assertEqual(receipt["pull_request"]["number"], 42)
+
+            status, error, out, _err = run_destroy_captured(
+                [f"DESTROY {plan['transfer_id']}"], plan_path, gh, az
+            )
+            self.assertIsNone(error)
+            self.assertEqual(status, 0)
+            self.assertIn("default branch was not modified", out)
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["status"], "destroyed")
+            self.assertEqual(az.delete_calls, [("testorg", PROJECT_ID, 101)])
+            self.assertEqual(
+                gh.delete_calls,
+                [
+                    "repos/owner/repo/git/refs/heads/"
+                    + plan["branch"]
+                ],
+            )
+            self.assertEqual(gh.pull_requests[42]["state"], "closed")
+
+    def test_apply_rejects_changed_source_without_writes(self):
+        gh = FakeGitHub(default_responses())
+        az = FakeAzure()
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = create_saved_plan(tmp, gh, az)
+            gh.responses["repos/owner/repo/git/ref/heads/main"] = {
+                "object": {"sha": "9" * 40}
+            }
+            status, error, _out, _err = run_apply_captured(
+                ["PUBLISH"], plan_path, gh, az
+            )
+            self.assertIsNone(status)
+            self.assertIn("head changed", str(error))
+            self.assertEqual(gh.post_calls, [])
+            self.assertEqual(az.create_calls, [])
+            self.assertFalse(transfer._receipt_path(plan_path).exists())
+
+    def test_apply_rejects_tampered_generated_yaml(self):
+        gh = FakeGitHub(default_responses())
+        az = FakeAzure()
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = create_saved_plan(tmp, gh, az)
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["pipelines"][0]["yaml"] += "# changed\n"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            status, error, _out, _err = run_apply_captured(
+                ["PUBLISH"], plan_path, gh, az
+            )
+            self.assertIsNone(status)
+            self.assertIn("no longer matches", str(error))
+            self.assertEqual(gh.post_calls, [])
+            self.assertEqual(az.create_calls, [])
+
+    def test_destroy_refuses_merged_pull_request_before_deleting(self):
+        gh = FakeGitHub(default_responses())
+        az = FakeAzure()
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = create_saved_plan(tmp, gh, az)
+            status, error, _out, _err = run_apply_captured(
+                ["PUBLISH"], plan_path, gh, az
+            )
+            self.assertIsNone(error)
+            self.assertEqual(status, 0)
+            gh.pull_requests[42]["merged"] = True
+            gh.pull_requests[42]["state"] = "closed"
+            status, error, _out, _err = run_destroy_captured(
+                [], plan_path, gh, az
+            )
+            self.assertIsNone(status)
+            self.assertIn("is merged", str(error))
+            self.assertEqual(gh.delete_calls, [])
+            self.assertEqual(az.delete_calls, [])
+
+    def test_destroy_requires_exact_confirmation(self):
+        gh = FakeGitHub(default_responses())
+        az = FakeAzure()
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = create_saved_plan(tmp, gh, az)
+            status, error, _out, _err = run_apply_captured(
+                ["PUBLISH"], plan_path, gh, az
+            )
+            self.assertIsNone(error)
+            self.assertEqual(status, 0)
+            status, error, _out, err = run_destroy_captured(
+                ["DESTROY"], plan_path, gh, az
+            )
+            self.assertIsNone(error)
+            self.assertEqual(status, 1)
+            self.assertIn("destroy cancelled", err)
+            self.assertEqual(gh.delete_calls, [])
+            self.assertEqual(az.delete_calls, [])
+            self.assertEqual(gh.pull_requests[42]["state"], "open")
+
+    def test_destroy_rejects_receipt_bound_to_different_plan(self):
+        gh = FakeGitHub(default_responses())
+        az = FakeAzure()
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_path = create_saved_plan(tmp, gh, az)
+            status, error, _out, _err = run_apply_captured(
+                ["PUBLISH"], plan_path, gh, az
+            )
+            self.assertIsNone(error)
+            self.assertEqual(status, 0)
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["source"]["head_sha"] = "9" * 40
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            status, error, _out, _err = run_destroy_captured(
+                [], plan_path, gh, az
+            )
+            self.assertIsNone(status)
+            self.assertIn("unchanged plan", str(error))
+            self.assertEqual(gh.delete_calls, [])
+            self.assertEqual(az.delete_calls, [])
+
+
 class TestAdapters(unittest.TestCase):
     def test_azure_create_pipeline_argv(self):
         az = transfer.Azure()
@@ -906,6 +1176,24 @@ class TestAdapters(unittest.TestCase):
             "https://dev.azure.com/testorg",
         )
         self.assertEqual(argv[argv.index("--project") + 1], PROJECT_ID)
+
+    def test_azure_pipeline_delete_argv(self):
+        az = transfer.Azure()
+        with mock.patch.object(transfer, "_run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            az.delete_pipeline("testorg", PROJECT_ID, 7)
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[1:3], ["pipelines", "delete"])
+        self.assertEqual(argv[argv.index("--id") + 1], "7")
+        self.assertIn("--yes", argv)
+        self.assertEqual(
+            argv[argv.index("--organization") + 1],
+            "https://dev.azure.com/testorg",
+        )
+        self.assertEqual(argv[argv.index("--project") + 1], PROJECT_ID)
+        self.assertIn("--only-show-errors", argv)
 
     def test_azure_project_list_args_and_no_project_flag(self):
         az = transfer.Azure()
@@ -1076,6 +1364,17 @@ class TestAdapters(unittest.TestCase):
             json.dumps({"sha": HEAD, "force": False}),
         )
 
+    def test_github_delete_uses_delete_method(self):
+        gh = transfer.GitHub()
+        with mock.patch.object(transfer, "_run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout="", stderr=""
+            )
+            gh.delete("repos/o/r/git/refs/heads/gh-to-azdo/x")
+        argv = run.call_args[0][0]
+        self.assertIn("DELETE", argv)
+        self.assertEqual(argv[-1], "repos/o/r/git/refs/heads/gh-to-azdo/x")
+
     def test_api_error_does_not_leak_stderr_token(self):
         gh = transfer.GitHub()
         with mock.patch.object(transfer, "_run") as run:
@@ -1199,6 +1498,7 @@ class TestCliRouting(unittest.TestCase):
             target=None,
             plan_only=True,
             license_path=None,
+            plan_output=None,
             post_merge_switch=True,
         )
 
@@ -1214,8 +1514,46 @@ class TestCliRouting(unittest.TestCase):
             target=target,
             plan_only=True,
             license_path=None,
+            plan_output=None,
             post_merge_switch=True,
         )
+
+    def test_transfer_plan_output_routes_through_cli(self):
+        from github_to_azdo import cli
+
+        with mock.patch.object(transfer, "run_transfer", return_value=0) as rt:
+            status = cli.main(
+                ["transfer", "--org", "o", "--plan", "--output", "plan.json"]
+            )
+        self.assertEqual(status, 0)
+        rt.assert_called_once_with(
+            org="o",
+            target=None,
+            plan_only=True,
+            license_path=None,
+            plan_output=Path("plan.json"),
+            post_merge_switch=True,
+        )
+
+    def test_apply_and_destroy_routes_through_cli(self):
+        from github_to_azdo import cli
+
+        with mock.patch.object(transfer, "run_apply", return_value=0) as apply:
+            status = cli.main(["apply", "plan.json", "--license", "license.json"])
+        self.assertEqual(status, 0)
+        apply.assert_called_once_with(
+            Path("plan.json"), license_path=Path("license.json")
+        )
+
+        with mock.patch.object(transfer, "run_destroy", return_value=0) as destroy:
+            status = cli.main(["apply", "plan.json", "--destroy"])
+        self.assertEqual(status, 0)
+        destroy.assert_called_once_with(Path("plan.json"))
+
+        with mock.patch.object(transfer, "run_destroy", return_value=0) as destroy:
+            status = cli.main(["destroy", "plan.json"])
+        self.assertEqual(status, 0)
+        destroy.assert_called_once_with(Path("plan.json"))
 
     def test_transfer_post_merge_opt_out_routes_through_cli(self):
         from github_to_azdo import cli
@@ -1230,6 +1568,7 @@ class TestCliRouting(unittest.TestCase):
             target=None,
             plan_only=True,
             license_path=None,
+            plan_output=None,
             post_merge_switch=False,
         )
 

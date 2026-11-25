@@ -5,14 +5,14 @@ Azure Pipelines YAML. GitHub Actions is the upstream source; this is the
 inverse direction of Microsoft's GitHub Actions Importer: you get a
 reviewable `azure-pipelines.yml` you can diff, edit, and import yourself.
 
-`audit`, `dry-run`, `migrate` and `batch` work fully offline. `transfer` is
-the only command that goes online — it signs in through your local `gh` and
-`az` CLIs and publishes a draft PR plus real Azure pipeline definitions.
+`audit`, `dry-run`, `migrate` and `batch` work fully offline. `transfer`,
+`apply` and `destroy` use your local `gh` and `az` CLIs to plan, publish, or
+remove recorded Azure pipeline migrations.
 
-The tool is a **copy/conversion tool only**. It never executes workflow code,
-never contacts GitHub, Azure DevOps, or any other remote except in `transfer`,
-and refuses to emit a runnable-but-wrong partial pipeline: anything outside
-the supported subset is reported as an error and blocks the output.
+The tool is a **copy/conversion tool only**. It never executes workflow code.
+Only `transfer`, `apply` and `destroy` contact GitHub or Azure DevOps; offline
+conversions refuse to emit runnable-but-wrong partial pipelines, reporting
+anything outside the supported subset as an error.
 
 ## Install
 
@@ -91,13 +91,14 @@ YAML, then import or commit it through your normal Azure Repos flow.
 ## Transferring workflows to Azure DevOps (`transfer`)
 
 ```bash
-gh-to-azdo transfer [--target URL | --org NAME] [--plan] [--license license.json] [--no-post-merge-switch]
+gh-to-azdo transfer [--target URL | --org NAME] [--plan [--output FILE]] [--license license.json] [--no-post-merge-switch]
+gh-to-azdo apply PLAN.json [--license license.json] [--destroy]
+gh-to-azdo destroy PLAN.json
 ```
 
-`transfer` is the only command that contacts remotes. It drives the local
-`gh` and `az` CLIs: the GitHub credential stays in `gh`'s local store and the
-Azure DevOps login stays in the local `az` session — this tool never handles
-PATs or OAuth apps itself.
+The remote commands drive the local `gh` and `az` CLIs: the GitHub credential
+stays in `gh`'s local store and the Azure DevOps login stays in the local `az`
+session — this tool never handles PATs or OAuth apps itself.
 
 - **GitHub auth:** checks `gh auth status --hostname github.com`; if missing it
   runs `gh auth login --hostname github.com --web --skip-ssh-key` (this can
@@ -150,10 +151,44 @@ containing an Azure DevOps PAT for a user allowed to edit build definitions
 changing the pipeline and can be rerun after the secret is added.
 
 `--plan` performs all reads and previews the selections and the
-file→pipeline mapping without any writes (sign-in still happens) — it is
-free for any number of workflows. Publishing requires typing `PUBLISH`; the
-default-branch head is re-checked before the first write and the run aborts
-if it moved. `q`, empty input, or EOF at any prompt cancels cleanly.
+file→pipeline mapping without remote writes (sign-in still happens) — it is
+free for any number of workflows. Add `--output migration.plan.json` to save
+a reusable JSON plan. The file contains the selected workflow snapshot and
+converted YAML, plus the source commit, destination IDs, pipeline names and
+paths; it contains no CLI credentials. The outfile is created exclusively
+and is never overwritten.
+
+Apply the saved plan without repeating the selections:
+
+```bash
+gh-to-azdo apply migration.plan.json [--license license.json]
+```
+
+Apply rechecks the source commit and regenerated YAML, destination project,
+service connection, and pipeline-name conflicts before asking you to type
+`PUBLISH`. It refuses stale or edited plans. A sidecar
+`migration.plan.json.state.json` records each confirmed remote resource as it
+is created, so partial applies can be inspected or cleaned up.
+
+Destroy the resources recorded for that plan after use:
+
+```bash
+gh-to-azdo destroy migration.plan.json
+# Equivalent:
+gh-to-azdo apply migration.plan.json --destroy
+```
+
+Destroy revalidates the recorded draft PR, branch, and pipeline definitions,
+then requires typing `DESTROY <transfer-id>`. It closes the unmerged draft PR,
+deletes only the pipelines recorded in the state file, and deletes the
+migration branch. It never disables source GitHub Actions. It refuses to
+destroy a merged migration PR because its generated YAML is then on the
+default branch; it does not remove or rewrite default-branch files. Keep the
+plan and its state sidecar together.
+
+Publishing requires typing `PUBLISH`; the default-branch head is re-checked
+before the first write and the run aborts if it moved. `q`, empty input, or
+EOF at any prompt cancels cleanly.
 
 In `--plan` mode every selected workflow is converted and **all** conversion
 blockers are collected and reported together (per-file diagnostics on
@@ -190,8 +225,9 @@ Honest limitations:
   require permission in that Azure DevOps organization.
 - If a write fails partway (e.g. the PR exists but a pipeline create fails),
   the error prints exactly which branch/PR/pipeline IDs exist and stops —
-  there is no automatic rollback, deletion, or retry; check both dashboards
-  before rerunning.
+  there is no automatic rollback or retry. With a saved plan, the state
+  sidecar records confirmed resources for an explicit `destroy`; check both
+  dashboards before retrying an ambiguous timed-out write.
 - Only the supported conversion subset transfers; anything else blocks the
   whole run (use `audit`/`migrate` for manual handling).
 
